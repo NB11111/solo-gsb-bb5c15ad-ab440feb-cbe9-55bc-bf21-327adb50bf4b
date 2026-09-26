@@ -13,6 +13,7 @@ from .digest import (
     run_design_panel,
     run_digest,
     run_erase_sites,
+    run_infer_partial_digest,
 )
 
 app = FastAPI(
@@ -83,6 +84,21 @@ async def erase_sites(request: Request) -> dict[str, Any]:
     except Exception:
         raise DigestError("请求体必须是合法的 JSON 对象")
     return run_erase_sites(payload)
+
+
+@app.post(
+    "/infer-partial-digest",
+    summary="由观测片段长度谱反推部分酶切（漏切）方案",
+    responses={
+        400: {"description": "序列/拓扑/酶/观测长度/容差非法，或有效切点超过 12 个"},
+    },
+)
+async def infer_partial_digest(request: Request) -> dict[str, Any]:
+    try:
+        payload = await request.json()
+    except Exception:
+        raise DigestError("请求体必须是合法的 JSON 对象")
+    return run_infer_partial_digest(payload)
 
 
 if __name__ == "__main__":
