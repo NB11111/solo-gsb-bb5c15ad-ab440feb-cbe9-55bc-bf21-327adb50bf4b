@@ -19,6 +19,10 @@ _ERASE_MIN_ENZYMES = 1
 _ERASE_MAX_ENZYMES = 8
 _ERASE_MAX_EDITS = 10
 
+_PARTIAL_MIN_OBSERVED = 1
+_PARTIAL_MAX_OBSERVED = 13
+_PARTIAL_MAX_EFFECTIVE_CUTS = 12
+
 
 class DigestError(ValueError):
     """输入非法或切点越界时抛出，reason 为可直接展示给调用方的中文原因。"""
@@ -588,4 +592,96 @@ def run_erase_sites(payload: Any) -> dict:
             }
             for i in range(len(enzymes))
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# /infer-partial-digest：由观测片段长度谱反推部分酶切（漏切）的保留切点
+# ---------------------------------------------------------------------------
+
+
+def _validate_observed_lengths(raw: Any) -> list[int]:
+    """校验观测片段长度：1～13 个正整数。"""
+    if raw is None:
+        raise DigestError("缺少 observed_lengths 字段")
+    if not isinstance(raw, list):
+        raise DigestError("observed_lengths 必须是正整数数组")
+    if not (_PARTIAL_MIN_OBSERVED <= len(raw) <= _PARTIAL_MAX_OBSERVED):
+        raise DigestError(
+            f"observed_lengths 数量必须在 {_PARTIAL_MIN_OBSERVED}.."
+            f"{_PARTIAL_MAX_OBSERVED} 之间，当前为 {len(raw)}"
+        )
+    observed: list[int] = []
+    for i, item in enumerate(raw):
+        if not _is_real_int(item) or item <= 0:
+            raise DigestError(
+                f"第 {i + 1} 个观测长度必须是正整数，当前为 {item!r}"
+            )
+        observed.append(item)
+    return observed
+
+
+def run_infer_partial_digest(payload: Any) -> dict:
+    """校验请求体并反推部分酶切方案，返回可直接 JSON 序列化的响应字典。
+
+    有效切点 = 全部酶切点中剔除线性端点（0 与 N）、环状取模去重后的集合，
+    最多 12 个（超限返回 400）。枚举有效切点的全部保留子集：保留子集按与
+    /digest 相同的规则切成片段（空子集即完整序列），长度谱升序后与升序的
+    观测长度逐位比较，片段数相同且差均不超过 tolerance 即为匹配。
+    漏切数 = 有效切点数 − 保留切点数；返回漏切数最少的全部匹配方案，
+    方案按保留切点列表（升序）字典序排列。
+    """
+    if not isinstance(payload, dict):
+        raise DigestError("请求体必须是 JSON 对象")
+
+    seq = _validate_sequence(payload.get("sequence"))
+    topology = _validate_topology(payload.get("topology"))
+    enzymes = _validate_enzymes(payload.get("enzymes"))
+    observed = _validate_observed_lengths(payload.get("observed_lengths"))
+    tolerance = _validate_tolerance(payload.get("tolerance"))
+
+    cuts, _hits = _find_cuts(seq, enzymes, topology)
+    n = len(seq)
+    if topology == "linear":
+        # 端点切点（0 与 N）只在端点断开、不产生新片段，不计入有效切点
+        effective = sorted(c for c in cuts if 0 < c < n)
+    else:
+        # _find_cuts 中环状切点已对 N 取模并去重
+        effective = sorted(cuts)
+    k = len(effective)
+    if k > _PARTIAL_MAX_EFFECTIVE_CUTS:
+        raise DigestError(
+            f"有效切点数量为 {k}，超过上限 {_PARTIAL_MAX_EFFECTIVE_CUTS}；"
+            "请减少酶数量或更换识别序列"
+        )
+
+    target = sorted(observed)
+    target_count = len(target)
+
+    # 保留切点从多到少枚举（即漏切数从少到多）；首次出现匹配方案的保留数
+    # 即对应最少漏切数，收集该层的全部匹配方案后停止。
+    solutions: list[dict] = []
+    missed = 0
+    for kept_count in range(k, -1, -1):
+        for combo in itertools.combinations(effective, kept_count):
+            profile = _length_profile(seq, set(combo), topology)
+            if len(profile) != target_count:
+                continue
+            if all(abs(p - o) <= tolerance for p, o in zip(profile, target)):
+                solutions.append(
+                    {"kept_cuts": list(combo), "fragment_lengths": profile}
+                )
+        if solutions:
+            missed = k - kept_count
+            break
+
+    if not solutions:
+        return {"status": "no_solution"}
+
+    solutions.sort(key=lambda s: s["kept_cuts"])
+    return {
+        "status": "solution",
+        "missed_cuts": missed,
+        "solution_count": len(solutions),
+        "solutions": solutions,
     }

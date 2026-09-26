@@ -17,6 +17,10 @@
 使修改后的序列不再含任何目标酶识别位点**（正反链、环状跨原点规则与 `/digest`
 完全一致，详见下文）。
 
+`POST /infer-partial-digest` 做**部分酶切（漏切）反推**：给定观测到的片段长度谱，
+枚举全部有效切点的保留子集，找出**漏切数最少**且与观测谱（在长度容差内）一致的
+全部切点组合（详见下文）。
+
 ## 单条命令启动（一键启动）
 
 需要 Docker（含 Compose 插件 v2）。在项目根目录执行：
@@ -26,9 +30,9 @@ docker compose up --build
 ```
 
 该命令会自动完成：构建镜像 → 安装 `requirements.txt` 中的全部依赖（FastAPI、uvicorn）
-→ 构建期导入校验（应用与 `/digest`、`/design-panel`、`/erase-sites` 路由可正常
-装配）→ 启动服务。首次构建需要联网下载依赖，之后的重建会命中 Docker 层缓存。
-加 `-d` 可后台运行（`docker compose up --build -d`）。
+→ 构建期导入校验（应用与 `/digest`、`/design-panel`、`/erase-sites`、
+`/infer-partial-digest` 路由可正常装配）→ 启动服务。首次构建需要联网下载依赖，
+之后的重建会命中 Docker 层缓存。加 `-d` 可后台运行（`docker compose up --build -d`）。
 
 服务启动后通过宿主机 **8000 端口**访问：
 
@@ -40,6 +44,7 @@ docker compose up --build
 | 单样本酶切接口 | `POST http://localhost:8000/digest` |
 | 多样本鉴别酶组合设计接口 | `POST http://localhost:8000/design-panel` |
 | 识别位点清除编辑设计接口 | `POST http://localhost:8000/erase-sites` |
+| 部分酶切反推接口 | `POST http://localhost:8000/infer-partial-digest` |
 
 停止服务：前台运行按 `Ctrl+C`；后台运行执行：
 
@@ -351,6 +356,100 @@ curl -s -X POST http://localhost:8000/erase-sites \
 {"status": "no_solution"}
 ```
 
+### `POST /infer-partial-digest`
+
+**部分酶切（partial digest）反推。** 先按与 `/digest` 完全相同的规则算出全部酶
+切点（正反链识别、环状跨首尾、切点取模去重），再假设部分切点因酶切不完全而
+**漏切**，从观测到的片段长度谱反推**哪些切点实际被切开**。
+
+**有效切点：** 全部切点中，线性序列**剔除端点切点**（`0` 与 `N`，只在端点断开、
+不产生新片段），环状序列切点**已对 `N` 取模并去重**。有效切点最多允许 **12** 个，
+超过即返回 400（此时子集枚举规模过大）。
+
+**匹配规则：** 枚举有效切点的全部**保留子集**（空子集表示完全未切开，唯一片段为
+完整序列），每个子集按原酶切规则生成片段，长度**升序排列**作为预测谱；观测长度
+同样升序排列。两者**片段数相同**且**逐位长度差均不超过** `tolerance` 即为一个
+匹配方案。漏切数 = 有效切点数 − 保留切点数。
+
+**选择规则（确定性）：** 在所有匹配方案中取**漏切数最少**者；同一最少漏切数下的
+全部方案**一并返回**，按保留切点列表（各自升序）的**字典序**排列。无任何匹配时
+返回 `{"status": "no_solution"}`（HTTP 200，属正常业务结果）。
+
+**请求体（JSON）：**
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `sequence` | string | 是 | DNA 序列，规则同 `/digest` |
+| `topology` | string | 是 | `linear` 或 `circular`，大小写不敏感 |
+| `enzymes` | array | 是 | 酶定义数组，格式同 `/digest`；传 `[]` 表示无酶（有效切点为空，只能匹配完整序列） |
+| `observed_lengths` | array | 是 | 观测片段长度，**1～13 个正整数** |
+| `tolerance` | integer | 是 | 非负整数长度容差；逐位长度差 `<= tolerance` 视为相等 |
+
+**响应（找到方案，HTTP 200）：**
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | 固定 `"solution"` |
+| `missed_cuts` | 最少漏切数（= 有效切点数 − 保留切点数） |
+| `solution_count` | 达到最少漏切数的方案总数 |
+| `solutions` | 方案列表，按保留切点列表字典序排列 |
+| `solutions[].kept_cuts` | 该方案保留（实际切开）的切点，升序 |
+| `solutions[].fragment_lengths` | 该方案的片段长度谱，**升序排列并保留重复长度** |
+
+找不到方案时仅返回：
+
+```json
+{"status": "no_solution"}
+```
+
+### 请求示例
+
+```bash
+curl -s -X POST http://localhost:8000/infer-partial-digest \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sequence": "AAGAATTCTTTGAATTCGG",
+    "topology": "linear",
+    "enzymes": [{"name": "EcoRI", "recognition": "GAATTC", "cut_offset": 1}],
+    "observed_lengths": [3, 3, 13],
+    "tolerance": 0
+  }'
+```
+
+该序列的完全酶切切点为 `[3, 7, 12, 16]`（5 段）。观测到 3 条带说明只切开了 2 个
+切点；在所有保留 2 个切点的组合中，只有保留 `3` 与 `16`（漏切 `7` 与 `12`）产生
+长度谱 `[3, 3, 13]`。响应：
+
+```json
+{
+  "status": "solution",
+  "missed_cuts": 2,
+  "solution_count": 1,
+  "solutions": [
+    {"kept_cuts": [3, 16], "fragment_lengths": [3, 3, 13]}
+  ]
+}
+```
+
+同一最少漏切数下可能有多个方案。例如观测 `[3, 4, 12]`（`tolerance=0`）时，保留
+`[3, 7]` 与保留 `[12, 16]` 的谱相同，两个方案都会返回（按保留切点列表字典序）：
+
+```json
+{
+  "status": "solution",
+  "missed_cuts": 2,
+  "solution_count": 2,
+  "solutions": [
+    {"kept_cuts": [3, 7],  "fragment_lengths": [3, 4, 12]},
+    {"kept_cuts": [12, 16], "fragment_lengths": [3, 4, 12]}
+  ]
+}
+```
+
+环状序列示例：`AAGAAGAA`（环状）被识别 `AAG`（`cut_offset=0`）的酶切在 `0` 与
+`3` 两处。观测 `[8]` 时，只保留其中任一个切点都把环线性化为全长 8，故最少漏切
+数为 1，返回 `kept_cuts` 分别为 `[0]` 与 `[3]` 的两个方案。
+
 ## 错误响应
 
 所有输入类错误返回 HTTP `400`，响应体形如 `{"error": "中文原因说明"}`，例如：
@@ -378,8 +477,16 @@ curl -s -X POST http://localhost:8000/erase-sites \
 - `第 1 个编辑的 base 非法：'N'；仅允许 A/C/G/T`
 - `第 1 个编辑（position 0）替换后的碱基 A 与原碱基相同；编辑必须改变原碱基`
 
+`/infer-partial-digest` 另有如下输入错误（同样返回 400）：
+
+- `缺少 observed_lengths 字段`
+- `observed_lengths 数量必须在 1..13 之间，当前为 14`
+- `第 1 个观测长度必须是正整数，当前为 0`
+- `有效切点数量为 13，超过上限 12；请减少酶数量或更换识别序列`
+
 `/design-panel` 的无方案结果（`{"status": "no_solution"}`）属于正常业务结果，
-返回 HTTP `200`，不是错误；`/erase-sites` 无法用候选编辑清零位点时同理。
+返回 HTTP `200`，不是错误；`/erase-sites` 无法用候选编辑清零位点、
+`/infer-partial-digest` 无任何保留子集匹配观测谱时同理。
 
 ## 本地开发（不使用 Docker）
 
@@ -397,6 +504,7 @@ uvicorn app.main:app --reload --port 8000
 python3 tests/test_digest.py
 python3 tests/test_design_panel.py
 python3 tests/test_erase_sites.py
+python3 tests/test_infer_partial_digest.py
 ```
 
 `test_digest.py` 覆盖：正向/反向命中与切点换算、回文酶的成对切点、环状跨首尾位点、切点
@@ -419,18 +527,27 @@ python3 tests/test_erase_sites.py
 线性/环状随机用例下与独立朴素枚举（独立扫描 + 同样择优规则）结果完全一致的
 等价性校验。
 
+`test_infer_partial_digest.py` 覆盖：完全酶切（漏切 0）与部分酶切唯一解、同一最少
+漏切数下多方案按保留切点字典序返回、容差逐位比较（差 1 在 tolerance 1 下匹配、
+tolerance 0 下无解）、无保留切点即完整序列、无酶与空有效切点、环状单切点线性化、
+环状切点取模去重、线性端点切点排除（且不计入 12 个上限）、有效切点 12/13 边界、
+观测长度数量 1～13 与正整数/类型校验、容差校验等各类非法输入 400，以及 300 组
+线性/环状随机用例下与独立朴素枚举参考（独立谱计算 + 同样择优规则）结果完全一致
+的等价性校验（含漏切数、谱和为 N、升序与字典序等不变量）。
+
 ## 项目结构
 
 ```
 .
 ├── app/
 │   ├── __init__.py
-│   ├── digest.py          # 酶切、鉴别酶组合与位点清除核心逻辑（纯函数，可独立测试）
-│   └── main.py            # FastAPI 入口与错误处理（/digest、/design-panel、/erase-sites）
+│   ├── digest.py          # 酶切、鉴别酶组合、位点清除与部分酶切反推核心逻辑（纯函数，可独立测试）
+│   └── main.py            # FastAPI 入口与错误处理（/digest、/design-panel、/erase-sites、/infer-partial-digest）
 ├── tests/
-│   ├── test_digest.py         # /digest 纯标准库测试脚本
-│   ├── test_design_panel.py   # /design-panel 纯标准库测试脚本
-│   └── test_erase_sites.py    # /erase-sites 纯标准库测试脚本
+│   ├── test_digest.py                 # /digest 纯标准库测试脚本
+│   ├── test_design_panel.py           # /design-panel 纯标准库测试脚本
+│   ├── test_erase_sites.py            # /erase-sites 纯标准库测试脚本
+│   └── test_infer_partial_digest.py   # /infer-partial-digest 纯标准库测试脚本
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

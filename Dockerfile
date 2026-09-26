@@ -13,11 +13,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# 初始化校验：依赖安装完成后立即导入应用（含 /digest、/design-panel 与 /erase-sites
-# 三个路由），依赖缺失或应用无法装配时构建直接失败，而非拖到容器启动后才暴露
+# 初始化校验：依赖安装完成后立即导入应用（含 /digest、/design-panel、/erase-sites
+# 与 /infer-partial-digest 四个路由），依赖缺失或应用无法装配时构建直接失败，
+# 而非拖到容器启动后才暴露
 RUN python -c "from app.main import app; \
 paths = {r.path for r in app.routes}; \
-assert {'/digest', '/design-panel', '/erase-sites'} <= paths, paths"
+assert {'/digest', '/design-panel', '/erase-sites', '/infer-partial-digest'} <= paths, paths"
 
 EXPOSE 8000
 
